@@ -1,0 +1,687 @@
+# -*- coding: utf-8 -*-
+"""
+Dual-Graph GConvGRU Model for Abaqus Finite Element Simulation Rollout
+
+Features:
+- Loads multiple .npz files containing Abaqus simulation data (displacement, stress, reaction force, mesh)
+- Dual graph structure: separate node graph + element graph processed with GConvGRU
+- Predicts node displacement U(t), element stress s_elem(t), and global reaction force RF2(t)
+- Autoregressive rollout with velocity and previous stress feedback
+- True batched training (multiple simulations processed in parallel on GPU)
+- Supports global or per-case normalization
+- Train/validation split with best model checkpointing
+- Configurable via YAML file + command-line overrides
+
+Author: [Your Name]
+Year: 2025
+"""
+
+import os
+import random
+import argparse
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric_temporal.nn.recurrent import GConvGRU
+import yaml
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+
+# ===================== Configuration & Argument Parsing =====================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Dual-Graph GConvGRU on Abaqus .npz data")
+    parser.add_argument("--config", type=str, default="config.yaml",
+                        help="Path to YAML configuration file")
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Directory containing .npz files (overrides config)")
+    parser.add_argument("--single_npz", type=str, default=None,
+                        help="Path to a single .npz file for training (overrides config)")
+    parser.add_argument("--save_path", type=str, default=None,
+                        help="Path to save the final model (overrides config)")
+    return parser.parse_args()
+
+
+def load_config(config_path: str):
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+# ===================== Utility Functions =====================
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def list_npz_files(data_dir: str, single_npz: str = None):
+    files = []
+    if single_npz and os.path.isfile(single_npz):
+        files.append(single_npz)
+    if data_dir and os.path.isdir(data_dir):
+        for f in os.listdir(data_dir):
+            if f.lower().endswith(".npz"):
+                files.append(os.path.join(data_dir, f))
+    files = sorted(list(set(files)))  # deduplicate and sort
+    return files
+
+
+def label_to_index_map(node_labels: np.ndarray):
+    return {int(lbl): i for i, lbl in enumerate(node_labels.tolist())}
+
+
+def compute_vel_from_disp(disp: np.ndarray):
+    T, N, _ = disp.shape
+    vel = np.zeros_like(disp, dtype=np.float32)
+    vel[1:] = disp[1:] - disp[:-1]
+    return vel
+
+
+def make_flags(N: int, node_labels: np.ndarray, surf_labels: np.ndarray):
+    surf = set(int(x) for x in surf_labels.tolist())
+    flags = np.array([1.0 if int(lbl) in surf else 0.0 for lbl in node_labels.tolist()],
+                     dtype=np.float32)
+    return flags.reshape(N, 1)
+
+
+def _pairs_for_elem_C3D8():
+    # 12 edges of Abaqus C3D8 element
+    return [(0,1),(1,2),(2,3),(3,0),
+            (4,5),(5,6),(6,7),(7,4),
+            (0,4),(1,5),(2,6),(3,7)]
+
+
+def build_node_edge_index(connectivity_idx: np.ndarray, mode="abaqus"):
+    edges = set()
+    if mode == "abaqus":
+        pairs = _pairs_for_elem_C3D8()
+        for elem in connectivity_idx:
+            for a, b in pairs:
+                i, j = int(elem[a]), int(elem[b])
+                if i != j:
+                    edges.add((i, j))
+                    edges.add((j, i))
+    else:  # complete graph per element
+        for elem in connectivity_idx:
+            for a in range(8):
+                for b in range(a + 1, 8):
+                    i, j = int(elem[a]), int(elem[b])
+                    if i != j:
+                        edges.add((i, j))
+                        edges.add((j, i))
+    if not edges:
+        return torch.empty((2, 0), dtype=torch.long)
+    return torch.tensor(list(edges), dtype=torch.long).t().contiguous()
+
+
+def build_elem_edge_index(connectivity_idx: np.ndarray, mode="face"):
+    Ne = connectivity_idx.shape[0]
+    if mode == "none" or Ne == 0:
+        return torch.empty((2, 0), dtype=torch.long)
+    edges = set()
+    if mode == "node":
+        node2elems = {}
+        for e, nodes in enumerate(connectivity_idx):
+            for n in nodes.tolist():
+                node2elems.setdefault(int(n), []).append(e)
+        for lst in node2elems.values():
+            for i in range(len(lst)):
+                for j in range(i + 1, len(lst)):
+                    a, b = lst[i], lst[j]
+                    edges.add((a, b))
+                    edges.add((b, a))
+    else:  # face-based adjacency
+        faces_local = [
+            (0,1,2,3), (4,5,6,7),
+            (0,1,5,4), (1,2,6,5),
+            (2,3,7,6), (3,0,4,7)
+        ]
+        face_map = {}
+        for e, nodes in enumerate(connectivity_idx):
+            for fc in faces_local:
+                face = tuple(sorted([int(nodes[i]) for i in fc]))
+                owner = face_map.get(face, -1)
+                if owner == -1:
+                    face_map[face] = e
+                else:
+                    edges.add((owner, e))
+                    edges.add((e, owner))
+    if not edges:
+        return torch.empty((2, 0), dtype=torch.long)
+    return torch.tensor(list(edges), dtype=torch.long).t().contiguous()
+
+
+def elems_to_nodes_scalar(s_elem: torch.Tensor, connectivity_idx: torch.Tensor, mode="mean"):
+    Ne = connectivity_idx.size(0)
+    if Ne == 0:
+        return torch.zeros(0, device=s_elem.device, dtype=s_elem.dtype)
+    N = int(connectivity_idx.max().item()) + 1
+    idx = connectivity_idx.reshape(-1)
+    acc = torch.zeros(N, device=s_elem.device, dtype=s_elem.dtype)
+    cnt = torch.zeros(N, device=s_elem.device, dtype=s_elem.dtype)
+    if mode == "rms":
+        acc.index_add_(0, idx, (s_elem.repeat_interleave(8))**2)
+        cnt.index_add_(0, idx, torch.ones_like(idx, dtype=cnt.dtype))
+        return torch.sqrt(acc / (cnt + 1e-6))
+    else:
+        acc.index_add_(0, idx, s_elem.repeat_interleave(8))
+        cnt.index_add_(0, idx, torch.ones_like(idx, dtype=cnt.dtype))
+        return acc / (cnt + 1e-6)
+
+
+def huber_loss(input: torch.Tensor, target: torch.Tensor, beta: float = 0.5, reduction: str = "mean"):
+    x = input - target
+    absx = torch.abs(x)
+    loss = torch.where(absx < beta, 0.5 * (x**2) / beta, absx - 0.5 * beta)
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    return loss
+
+
+def laplacian_smooth_loss(u_t: torch.Tensor, edge_index: torch.Tensor):
+    if edge_index.numel() == 0:
+        return u_t.new_zeros(())
+    src, dst = edge_index
+    diff = u_t[dst] - u_t[src]
+    return (diff * diff).mean()
+
+
+def case_stats_from_arrays(coord, disp, s_elem):
+    vel = compute_vel_from_disp(disp)
+    mu_coord = coord.mean(axis=0).astype(np.float32)
+    sig_coord = coord.std(axis=0).astype(np.float32) + 1e-8
+    mu_u = disp.mean(axis=(0,1)).astype(np.float32)
+    sig_u = disp.std(axis=(0,1)).astype(np.float32) + 1e-8
+    mu_v = vel.mean(axis=(0,1)).astype(np.float32)
+    sig_v = vel.std(axis=(0,1)).astype(np.float32) + 1e-8
+    mu_s = float(s_elem.mean())
+    sig_s = float(s_elem.std() + 1e-8)
+    return dict(mu_coord=mu_coord, sig_coord=sig_coord,
+                mu_u=mu_u, sig_u=sig_u,
+                mu_v=mu_v, sig_v=sig_v,
+                mu_s=mu_s, sig_s=sig_s)
+
+
+def compute_global_stats(npz_files, frame_stride=1, s_elem_mode="mean"):
+    sum_coord = np.zeros(3, dtype=np.float64)
+    sumsq_coord = np.zeros(3, dtype=np.float64)
+    count_coord = 0
+    sum_u = np.zeros(3, dtype=np.float64)
+    sumsq_u = np.zeros(3, dtype=np.float64)
+    count_u = 0
+    sum_v = np.zeros(3, dtype=np.float64)
+    sumsq_v = np.zeros(3, dtype=np.float64)
+    count_v = 0
+    sum_s = 0.0
+    sumsq_s = 0.0
+    count_s = 0
+
+    for path in npz_files:
+        dat = np.load(path, allow_pickle=True)
+        disp = dat["disp"].astype(np.float32)[::frame_stride]
+        coord = dat["node_coords"].astype(np.float32)
+        conn = dat["connectivity"].astype(np.int64)
+        nlab = dat["node_labels"].astype(np.int64)
+
+        if "s_elem" in dat:
+            s_elem = dat["s_elem"].astype(np.float32)[::frame_stride]
+        else:
+            s_node = dat["s"].astype(np.float32)[::frame_stride]
+            l2i = label_to_index_map(nlab)
+            conn_idx_np = np.vectorize(lambda x: l2i[int(x)])(conn)
+            s_elem_list = []
+            for t in range(s_node.shape[0]):
+                vals = s_node[t][conn_idx_np]
+                if s_elem_mode == "mean":
+                    s_elem_list.append(vals.mean(axis=1))
+                else:
+                    s_elem_list.append(np.sqrt((vals*vals).mean(axis=1) + 1e-12))
+            s_elem = np.stack(s_elem_list, axis=0)
+
+        vel = compute_vel_from_disp(disp)
+
+        sum_coord += coord.sum(axis=0, dtype=np.float64)
+        sumsq_coord += (coord.astype(np.float64)**2).sum(axis=0)
+        count_coord += coord.shape[0]
+
+        disp_flat = disp.reshape(-1, 3).astype(np.float64)
+        sum_u += disp_flat.sum(axis=0)
+        sumsq_u += (disp_flat**2).sum(axis=0)
+        count_u += disp_flat.shape[0]
+
+        vel_flat = vel.reshape(-1, 3).astype(np.float64)
+        sum_v += vel_flat.sum(axis=0)
+        sumsq_v += (vel_flat**2).sum(axis=0)
+        count_v += vel_flat.shape[0]
+
+        s_flat = s_elem.reshape(-1).astype(np.float64)
+        sum_s += s_flat.sum()
+        sumsq_s += (s_flat**2).sum()
+        count_s += s_flat.shape[0]
+
+    def finalize(sum_, sumsq_, cnt):
+        mean = (sum_ / max(cnt, 1)).astype(np.float32)
+        var = (sumsq_ / max(cnt, 1)) - mean**2
+        std = np.sqrt(np.maximum(var, 0.0)).astype(np.float32) + 1e-8
+        return mean, std
+
+    mu_coord, sig_coord = finalize(sum_coord, sumsq_coord, count_coord)
+    mu_u, sig_u = finalize(sum_u, sumsq_u, count_u)
+    mu_v, sig_v = finalize(sum_v, sumsq_v, count_v)
+    mu_s, sig_s = finalize(np.array([sum_s]), np.array([sumsq_s]), count_s)
+    mu_s = float(mu_s[0])
+    sig_s = float(sig_s[0])
+
+    return dict(mu_coord=mu_coord, sig_coord=sig_coord,
+                mu_u=mu_u, sig_u=sig_u,
+                mu_v=mu_v, sig_v=sig_v,
+                mu_s=mu_s, sig_s=sig_s)
+
+
+def build_batched_edge_index(edge_index: torch.Tensor, batch_size: int, num_nodes: int):
+    if edge_index.numel() == 0 or batch_size == 1:
+        return edge_index
+    ei_list = []
+    for b in range(batch_size):
+        offset = b * num_nodes
+        ei_list.append(edge_index + torch.tensor([offset, offset], device=edge_index.device, dtype=edge_index.dtype).view(2, 1))
+    return torch.cat(ei_list, dim=1)
+
+
+def build_batched_elem_nodes_idx(elem_nodes_idx: torch.Tensor, batch_size: int, num_nodes: int):
+    if batch_size == 1:
+        return elem_nodes_idx
+    idx_list = []
+    for b in range(batch_size):
+        offset = b * num_nodes
+        idx_list.append(elem_nodes_idx + offset)
+    return torch.cat(idx_list, dim=0)
+
+
+# ===================== Model =====================
+class DualGraphModel(nn.Module):
+    def __init__(self, in_node_f: int, hidden_node: int, hidden_elem: int,
+                 K_node: int = 1, K_elem: int = 1):
+        super().__init__()
+        self.node_gru = GConvGRU(in_node_f, hidden_node, K=K_node)
+        self.elem_gru = GConvGRU(hidden_node, hidden_elem, K=K_elem)
+        self.head_u = nn.Linear(hidden_node, 3)
+        self.head_s_elem = nn.Linear(hidden_elem, 1)
+        self.head_rf2 = nn.Linear(hidden_elem, 1)
+
+    def forward_batch(self, X_node_seq_batch, node_edge_index, elem_edge_index, elem_nodes_idx,
+                      Y_u=None, Y_s_elem=None, teacher_forcing_prob=0.0, s_prev_mode="mean"):
+        T, B, N, F = X_node_seq_batch.shape
+        Ne = elem_nodes_idx.size(0)
+        X = [X_node_seq_batch[t].clone() for t in range(T)]
+
+        node_edge_b = build_batched_edge_index(node_edge_index, B, N)
+        elem_edge_b = build_batched_edge_index(elem_edge_index, B, Ne)
+        elem_nodes_b = build_batched_elem_nodes_idx(elem_nodes_idx, B, N)
+
+        Hn = None
+        He = None
+        outs_u, outs_se, outs_rf2 = [], [], []
+
+        for t in range(T):
+            x_t = X[t].reshape(B * N, F)
+            Hn = self.node_gru(x_t, edge_index=node_edge_b, H=Hn)
+            u_t = self.head_u(Hn).reshape(B, N, 3)
+
+            if Ne > 0:
+                H_e_in = Hn[elem_nodes_b].mean(dim=1)
+                He = self.elem_gru(H_e_in, edge_index=elem_edge_b, H=He)
+                s_e_t = self.head_s_elem(He).squeeze(-1).reshape(B, Ne)
+                h_rf2 = He.reshape(B, Ne, -1).mean(dim=1)
+                rf2_t = self.head_rf2(h_rf2).squeeze(-1)
+            else:
+                s_e_t = u_t.new_zeros((B, 0))
+                rf2_t = u_t.new_zeros((B,))
+
+            outs_u.append(u_t)
+            outs_se.append(s_e_t)
+            outs_rf2.append(rf2_t)
+
+            if t + 1 < T:
+                use_tf = teacher_forcing_prob > 0 and random.random() < teacher_forcing_prob and Y_u is not None and Y_s_elem is not None
+                u_feed = Y_u[t] if use_tf else u_t
+                s_e_feed = Y_s_elem[t] if use_tf else s_e_t
+
+                u_prev = X[t][:, :, 3:6]
+                v_feed = u_feed - u_prev
+                X[t+1][:, :, 3:6] = u_feed
+                X[t+1][:, :, 8:11] = v_feed
+
+                if s_prev_mode != "none" and Ne > 0:
+                    s_prev_list = []
+                    for b in range(B):
+                        s_node_b = elems_to_nodes_scalar(s_e_feed[b], elem_nodes_idx, mode=s_prev_mode)
+                        s_prev_list.append(s_node_b.view(1, -1))
+                    X[t+1][:, :, 11] = torch.cat(s_prev_list, dim=0)
+
+        return torch.stack(outs_u), torch.stack(outs_se), torch.stack(outs_rf2)
+
+
+# ===================== Data Loading =====================
+def load_case(npz_path: str, device: torch.device, stats_dict: dict, cfg: dict):
+    dat = np.load(npz_path, allow_pickle=True)
+    disp = dat["disp"].astype(np.float32)[::cfg["frame_stride"]]
+    coord = dat["node_coords"].astype(np.float32)
+    conn = dat["connectivity"].astype(np.int64)
+    nlab = dat["node_labels"].astype(np.int64)
+    surf = dat["SURF1_NODE_LABELS"].astype(np.int64)
+    times = dat["frame_times"].astype(np.float32)[::cfg["frame_stride"]]
+    rf2 = dat["rf2"].astype(np.float32)[::cfg["frame_stride"]]
+
+    # Element stress handling
+    if "s_elem" in dat:
+        s_elem = dat["s_elem"].astype(np.float32)[::cfg["frame_stride"]]
+    else:
+        s_node = dat["s"].astype(np.float32)[::cfg["frame_stride"]]
+        l2i = label_to_index_map(nlab)
+        conn_idx_np = np.vectorize(lambda x: l2i[int(x)])(conn)
+        s_elem_list = []
+        for t in range(s_node.shape[0]):
+            vals = s_node[t][conn_idx_np]
+            if cfg["s_prev_mode"] == "mean":
+                s_elem_list.append(vals.mean(axis=1))
+            else:
+                s_elem_list.append(np.sqrt((vals*vals).mean(axis=1) + 1e-12))
+        s_elem = np.stack(s_elem_list, axis=0)
+
+    # Graph construction
+    l2i = label_to_index_map(nlab)
+    conn_idx = np.vectorize(lambda x: l2i[int(x)])(conn)
+    node_edge = build_node_edge_index(conn_idx, mode=cfg["edge_mode_node"]).to(device)
+    elem_edge = build_elem_edge_index(conn_idx, mode=cfg["elem_adj_mode"]).to(device)
+    elem_nodes_idx = torch.tensor(conn_idx, dtype=torch.long, device=device)
+
+    flag = make_flags(coord.shape[0], nlab, surf)
+
+    # Normalization
+    norm_scope = cfg["norm_scope"]
+    if norm_scope == "per_case":
+        stats_used = case_stats_from_arrays(coord, disp, s_elem)
+    else:
+        stats_used = stats_dict
+
+    mu_c, sg_c = stats_used["mu_coord"], stats_used["sig_coord"]
+    mu_u, sg_u = stats_used["mu_u"], stats_used["sig_u"]
+    mu_v, sg_v = stats_used["mu_v"], stats_used["sig_v"]
+    mu_s, sg_s = stats_used["mu_s"], stats_used["sig_s"]
+
+    vel = compute_vel_from_disp(disp)
+    coord_n = (coord - mu_c) / sg_c
+    disp_n = (disp - mu_u) / sg_u
+    vel_n = (vel - mu_v) / sg_v
+    s_elem_n = (s_elem - mu_s) / sg_s
+
+    T, N, _ = disp.shape
+    in_node_f = cfg["in_node_features"]
+    X = torch.zeros((T, N, in_node_f), dtype=torch.float32, device=device)
+
+    coord_t = torch.tensor(coord_n, device=device)
+    flag_t = torch.tensor(flag, device=device)
+    disp_t = torch.tensor(disp_n, device=device)
+    vel_t = torch.tensor(vel_n, device=device)
+    s_elem_t = torch.tensor(s_elem_n, device=device)
+    rf2_t = torch.tensor(rf2, dtype=torch.float32, device=device)
+
+    t0, t1 = float(times[0]), float(times[-1])
+    alpha_all = ((times - t0) / (t1 - t0 + 1e-12)).astype(np.float32)
+
+    for t in range(T):
+        alpha = torch.full((N, 1), alpha_all[t], device=device)
+        u_prev = torch.zeros((N, 3), device=device) if t == 0 else disp_t[t-1]
+        v_prev = torch.zeros((N, 3), device=device) if t == 0 else vel_t[t-1]
+        s_prev_node = torch.zeros((N, 1), device=device) if t == 0 else elems_to_nodes_scalar(s_elem_t[t-1], elem_nodes_idx, mode="mean")
+        X[t] = torch.cat([coord_t, u_prev, alpha, flag_t, v_prev, s_prev_node.view(-1, 1)], dim=1)
+
+    return dict(
+        X_node=X, node_edge=node_edge, elem_edge=elem_edge, elem_nodes_idx=elem_nodes_idx,
+        Y_u=disp_t, Y_s_elem=s_elem_t, Y_rf2=rf2_t
+    )
+
+
+# ===================== Validation =====================
+@torch.no_grad()
+def evaluate(model, files, device, gstats, node_e0, elem_e0, enodes0, cfg):
+    if not files:
+        return None
+    model.eval()
+    total_L = total_Lu = total_Ls = total_Lrf2 = total_Llap = 0.0
+    steps = 0
+    batch_cases = cfg["batch_cases"]
+
+    for start in range(0, len(files), batch_cases):
+        batch_files = files[start:start + batch_cases]
+        B = len(batch_files)
+        X_list, Y_u_list, Y_se_list, Y_rf2_list = [], [], [], []
+
+        for f in batch_files:
+            case = load_case(f, device, gstats, cfg)
+            X_list.append(case["X_node"])
+            Y_u_list.append(case["Y_u"])
+            Y_se_list.append(case["Y_s_elem"])
+            Y_rf2_list.append(case["Y_rf2"])
+
+        X_batch = torch.stack(X_list, dim=1)
+        Y_u_batch = torch.stack(Y_u_list, dim=1)
+        Y_se_batch = torch.stack(Y_se_list, dim=1)
+        Y_rf2_batch = torch.stack(Y_rf2_list, dim=1)
+
+        eff_s_prev_mode = "none" if cfg["no_s_feedback"] or cfg["s_prev_mode"] == "none" else cfg["s_prev_mode"]
+        if cfg["no_s_feedback"] or cfg["s_prev_mode"] == "none":
+            X_batch[:, :, :, 11] = 0.0
+
+        u_hat, s_elem_hat, rf2_hat = model.forward_batch(
+            X_batch, node_e0, elem_e0, enodes0,
+            Y_u=None, Y_s_elem=None, teacher_forcing_prob=0.0, s_prev_mode=eff_s_prev_mode
+        )
+
+        Lu = F.mse_loss(u_hat, Y_u_batch, reduction="mean")
+        Ls = huber_loss(s_elem_hat, Y_se_batch, beta=0.5, reduction="mean") if cfg["use_smooth_l1"] else F.mse_loss(s_elem_hat, Y_se_batch, reduction="mean")
+        Lrf2 = F.mse_loss(rf2_hat, Y_rf2_batch, reduction="mean")
+
+        Llap = torch.zeros((), device=device)
+        if cfg["lambda_lap"] > 0.0:
+            T_b = u_hat.size(0)
+            node_edge_b = build_batched_edge_index(node_e0, B, node_e0.max().item() + 1)
+            for t in range(T_b):
+                Llap += laplacian_smooth_loss(u_hat[t].reshape(B * (node_e0.max().item() + 1), 3), node_edge_b)
+            Llap /= T_b
+
+        L = Lu + cfg["lambda_s"] * Ls + cfg["lambda_lap"] * Llap + cfg["lambda_rf2"] * Lrf2
+
+        total_L += L.item()
+        total_Lu += Lu.item()
+        total_Ls += Ls.item()
+        total_Lrf2 += Lrf2.item()
+        total_Llap += Llap.item()
+        steps += 1
+
+    return (total_L / steps, total_Lu / steps, total_Ls / steps, total_Lrf2 / steps, total_Llap / steps)
+
+
+# ===================== Training =====================
+def main():
+    args = parse_args()
+    cfg = load_config(args.config)
+
+    # Command-line overrides
+    if args.data_dir:
+        cfg["data_dir"] = args.data_dir
+    if args.single_npz:
+        cfg["single_npz"] = args.single_npz
+    if args.save_path:
+        cfg["save_path"] = args.save_path
+
+    os.makedirs(os.path.dirname(cfg["save_path"]), exist_ok=True)
+
+    set_seed(cfg["seed"])
+    device = torch.device("cuda" if cfg["use_cuda"] and torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    files = list_npz_files(cfg.get("data_dir"), cfg.get("single_npz"))
+    if not files:
+        raise FileNotFoundError("No .npz files found. Check data_dir or single_npz path.")
+    print(f"Found {len(files)} simulation cases.")
+
+    # Global normalization
+    if cfg["norm_scope"] == "global":
+        print("Computing global normalization statistics across all cases...")
+        gstats = compute_global_stats(files, frame_stride=cfg["frame_stride"], s_elem_mode=cfg["s_prev_mode"])
+    else:
+        print("Using per-case normalization.")
+        gstats = None
+
+    # Train/val split
+    random.shuffle(files)
+    n_val = max(1, int(len(files) * cfg["val_ratio"])) if cfg["val_ratio"] > 0 and len(files) >= 2 else 0
+    val_files = files[:n_val]
+    train_files = files[n_val:]
+    print(f"Training cases: {len(train_files)} | Validation cases: {len(val_files)}")
+
+    # Load reference graph structure from first training case
+    ref_case = load_case(train_files[0], device, gstats, cfg)
+    node_e0 = ref_case["node_edge"]
+    elem_e0 = ref_case["elem_edge"]
+    enodes0 = ref_case["elem_nodes_idx"]
+    N0 = ref_case["X_node"].shape[1]
+    print(f"Mesh info - Nodes: {N0}, Elements: {enodes0.shape[0]}, Node edges: {node_e0.shape[1]}, Elem edges: {elem_e0.shape[1]}")
+
+    model = DualGraphModel(
+        in_node_f=cfg["in_node_features"],
+        hidden_node=cfg["hidden_node"],
+        hidden_elem=cfg["hidden_elem"],
+        K_node=cfg["K_node"],
+        K_elem=cfg["K_elem"]
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+    scheduler = None
+    if cfg["use_lr_sched"]:
+        scheduler = ReduceLROnPlateau(
+            optimizer, mode="min", factor=cfg["plateau_factor"],
+            patience=cfg["plateau_patience"], threshold=cfg["plateau_threshold"],
+            cooldown=cfg["plateau_cooldown"], min_lr=cfg["plateau_min_lr"],
+            verbose=cfg["plateau_verbose"]
+        )
+        print(f"Learning rate scheduler enabled (monitor: {cfg['plateau_monitor']})")
+
+    best_val_loss = float('inf')
+    best_path = cfg["save_path"].rsplit(".", 1)[0] + "_best.pth"
+
+    for epoch in range(1, cfg["epochs"] + 1):
+        random.shuffle(train_files)
+        model.train()
+        epoch_loss = epoch_lu = epoch_ls = epoch_lrf2 = epoch_llap = 0.0
+        steps = 0
+        processed_cases = 0
+
+        # Teacher forcing decay
+        tf_prob = cfg["p_tf_start"] * (1.0 - (epoch - 1) / cfg["k_steps_tf"]) if epoch <= cfg["k_steps_tf"] and cfg["k_steps_tf"] > 0 else 0.0
+
+        for start in range(0, len(train_files), cfg["batch_cases"]):
+            batch_files = train_files[start:start + cfg["batch_cases"]]
+            B = len(batch_files)
+            X_list, Y_u_list, Y_se_list, Y_rf2_list = [], [], [], []
+
+            for f in batch_files:
+                case = load_case(f, device, gstats, cfg)
+                X_list.append(case["X_node"])
+                Y_u_list.append(case["Y_u"])
+                Y_se_list.append(case["Y_s_elem"])
+                Y_rf2_list.append(case["Y_rf2"])
+
+            X_batch = torch.stack(X_list, dim=1)
+            Y_u_batch = torch.stack(Y_u_list, dim=1)
+            Y_se_batch = torch.stack(Y_se_list, dim=1)
+            Y_rf2_batch = torch.stack(Y_rf2_list, dim=1)
+
+            if cfg["no_s_feedback"] or cfg["s_prev_mode"] == "none":
+                X_batch[:, :, :, 11] = 0.0
+                eff_s_prev_mode = "none"
+            else:
+                eff_s_prev_mode = cfg["s_prev_mode"]
+
+            optimizer.zero_grad()
+            u_hat, s_elem_hat, rf2_hat = model.forward_batch(
+                X_batch, node_e0, elem_e0, enodes0,
+                Y_u=Y_u_batch, Y_s_elem=Y_se_batch,
+                teacher_forcing_prob=tf_prob, s_prev_mode=eff_s_prev_mode
+            )
+
+            Lu = F.mse_loss(u_hat, Y_u_batch, reduction="mean")
+            Ls = huber_loss(s_elem_hat, Y_se_batch, beta=0.5, reduction="mean") if cfg["use_smooth_l1"] else F.mse_loss(s_elem_hat, Y_se_batch, reduction="mean")
+            Lrf2 = F.mse_loss(rf2_hat, Y_rf2_batch, reduction="mean")
+
+            Llap = torch.zeros((), device=device)
+            if cfg["lambda_lap"] > 0.0:
+                T_b = u_hat.size(0)
+                node_edge_b = build_batched_edge_index(node_e0, B, N0)
+                for t in range(T_b):
+                    Llap += laplacian_smooth_loss(u_hat[t].reshape(B * N0, 3), node_edge_b)
+                Llap /= T_b
+
+            loss = Lu + cfg["lambda_s"] * Ls + cfg["lambda_lap"] * Llap + cfg["lambda_rf2"] * Lrf2
+            loss.backward()
+
+            if cfg["clip_norm"] > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["clip_norm"])
+
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            epoch_lu += Lu.item()
+            epoch_ls += Ls.item()
+            epoch_lrf2 += Lrf2.item()
+            epoch_llap += Llap.item()
+            steps += 1
+            processed_cases += B
+
+        avg_loss = epoch_loss / steps
+        if cfg["use_lr_sched"] and cfg["plateau_monitor"] == "train":
+            scheduler.step(avg_loss)
+
+        print(f"[Epoch {epoch:4d}/{cfg['epochs']}] "
+              f"Train Loss: {avg_loss:.6e} | Lu: {epoch_lu/steps:.6e} Ls: {epoch_ls/steps:.6e} "
+              f"Lrf2: {epoch_lrf2/steps:.6e} Llap: {epoch_llap/steps:.6e} | "
+              f"TF prob: {tf_prob:.3f} | Cases: {processed_cases} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+
+        # Validation
+        if val_files and cfg["val_interval"] > 0 and epoch % cfg["val_interval"] == 0:
+            val_metrics = evaluate(model, val_files, device, gstats, node_e0, elem_e0, enodes0, cfg)
+            if val_metrics:
+                val_loss, val_lu, val_ls, val_lrf2, val_llap = val_metrics
+                print(f"  >>> Val Loss: {val_loss:.6e} | Lu: {val_lu:.6e} Ls: {val_ls:.6e} "
+                      f"Lrf2: {val_lrf2:.6e} Llap: {val_llap:.6e}")
+
+                if cfg["use_lr_sched"] and cfg["plateau_monitor"] == "val":
+                    scheduler.step(val_loss)
+
+                if cfg["save_best"] and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save({
+                        'model_state_dict': model.state_dict(),
+                        'config': cfg
+                    }, best_path)
+                    print(f"  >>> New best model saved: {best_path}")
+
+    # Save final model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': cfg
+    }, cfg["save_path"])
+    print(f"Training completed. Final model saved to: {cfg['save_path']}")
+    if cfg["save_best"] and best_val_loss < float('inf'):
+        print(f"Best validation loss: {best_val_loss:.6e} -> {best_path}")
+
+
+if __name__ == "__main__":
+    main()
