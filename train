@@ -2,19 +2,7 @@
 """
 Dual-Graph GConvGRU Model for Abaqus Finite Element Simulation Rollout
 
-Features:
-- Loads multiple .npz files containing Abaqus simulation data (displacement, stress, reaction force, mesh)
-- Dual graph structure: separate node graph + element graph processed with GConvGRU
-- Predicts node displacement U(t), element stress s_elem(t), and global reaction force RF2(t)
-- Autoregressive rollout with velocity and previous stress feedback
-- True batched training (multiple simulations processed in parallel on GPU)
-- Supports global or per-case normalization
-- Train/validation split with best model checkpointing
-- Configurable via YAML file + command-line overrides
 
-Author: [Your Name]
-Year: 2025
-"""
 
 import os
 import random
