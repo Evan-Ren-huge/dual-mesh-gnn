@@ -1,0 +1,78 @@
+# ===================== Data =====================
+seed: 42
+use_cuda: true
+
+# Data source (choose one: data_dir or single_npz)
+data_dir: "/path/to/your/npz_dir"
+single_npz: null
+
+# Model output
+save_path: "checkpoints/dualgraph_gconvgru_final.pth"
+save_best: true
+
+# Frame sampling stride
+frame_stride: 1
+
+# Normalization scope: "per_case" or "global"
+norm_scope: "global"
+
+# Validation split ratio (0–1)
+val_ratio: 0.1
+# Validation interval (epochs)
+val_interval: 1
+
+# ===================== Graph construction =====================
+# Node graph mode: "abaqus" (C3D8 12-edge connectivity) or full intra-element graph
+edge_mode_node: "abaqus"
+
+# Element adjacency: "face", "node", or "none"
+elem_adj_mode: "face"
+
+# ===================== Input features =====================
+# [coord(3), u_prev(3), alpha(1), flag(1), v_prev(3), s_prev_node(1)]
+in_node_features: 12
+
+# Element-stress feedback mode: "mean", "rms", or "none"
+s_prev_mode: "mean"
+# Force disabling stress feedback regardless of s_prev_mode
+no_s_feedback: false
+
+# ===================== Model =====================
+hidden_node: 128
+hidden_elem: 128
+K_node: 1
+K_elem: 1
+
+# ===================== Training =====================
+epochs: 800
+batch_cases: 16
+lr: 0.001
+
+# Gradient clipping (0 = disabled)
+clip_norm: 1.0
+
+# ===================== Loss weights =====================
+# Total loss = Lu + lambda_s*Ls + lambda_lap*Llap + lambda_rf2*Lrf2
+lambda_s: 1.0
+lambda_lap: 0.0
+lambda_rf2: 1.0
+
+# Use Smooth L1 (Huber) loss for element stress
+use_smooth_l1: true
+
+# ===================== Teacher Forcing =====================
+# Initial teacher forcing probability
+p_tf_start: 1.0
+# Linear decay to 0 over k_steps_tf epochs (0 disables teacher forcing)
+k_steps_tf: 20
+
+# ===================== LR Scheduler (ReduceLROnPlateau) =====================
+use_lr_sched: true
+# Monitor metric: "train" or "val"
+plateau_monitor: "val"
+plateau_factor: 0.5
+plateau_patience: 3
+plateau_threshold: 1.0e-4
+plateau_cooldown: 0
+plateau_min_lr: 1.0e-6
+plateau_verbose: true
