@@ -1,20 +1,27 @@
-# Dual-Graph GConvGRU for Abaqus Finite Element Simulations
+# Dual-Graph GConvGRU for Accelerating Abaqus Simulations
 
-A PyTorch implementation of a dual-graph recurrent Graph Neural Network (GNN) using `GConvGRU` from PyTorch Geometric Temporal. The model processes Abaqus simulation data to predict:
+This repository provides an end-to-end pipeline for accelerating Abaqus finite-element
+simulations using a dual-graph temporal Graph Neural Network (GConvGRU).
 
-- Node displacements `U(t)`
-- Element-averaged stress `s_elem(t)`
-- Global reaction force `RF2(t)`
+The workflow consists of:
+1. Exporting Abaqus `.odb` files into compressed `.npz` datasets.
+2. Training a dual-graph recurrent GNN to predict nodal displacement, element stress,
+   and global reaction forces in an autoregressive rollout setting.
 
-Key features:
-- Dual graph structure: separate node graph and element graph
-- True batched training across multiple simulation cases
-- Global or per-case normalization
-- Teacher forcing with decay schedule
-- Validation split and best model checkpointing
-- Configurable via YAML
+The project is designed for research and engineering applications where repeated
+finite-element simulations are computationally expensive.
 
-## Installation
+---
 
-```bash
-pip install torch torch-geometric-temporal numpy pyyaml
+## Repository Structure
+
+```text
+.
+├── src/                    # Training code (PyTorch + PyG Temporal)
+│   └── train.py
+├── tools/
+│   ├── export_odb_to_npz.py # Abaqus ODB → NPZ data exporter
+│   └── README.md            # Detailed documentation for the exporter
+├── configs/
+│   └── config.yaml          # Training configuration
+└── README.md
