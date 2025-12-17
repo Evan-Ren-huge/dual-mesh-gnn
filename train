@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Dual-Graph GConvGRU Model for Abaqus Finite Element Simulation Rollout
-
-
+"""
 
 import os
 import random
@@ -195,6 +194,18 @@ def case_stats_from_arrays(coord, disp, s_elem):
                 mu_s=mu_s, sig_s=sig_s)
 
 
+# ======= [ADDED] helper: decouple elem aggregation mode from s_prev_mode =======
+def get_s_elem_agg_mode(cfg: dict) -> str:
+    """
+    For aggregating nodal s -> element s, allow only mean / rms.
+    s_prev_mode may be 'none', but aggregation should not use 'none'.
+    """
+    m = str(cfg.get("s_prev_mode", "mean")).lower()
+    if m == "rms":
+        return "rms"
+    return "mean"
+
+
 def compute_global_stats(npz_files, frame_stride=1, s_elem_mode="mean"):
     sum_coord = np.zeros(3, dtype=np.float64)
     sumsq_coord = np.zeros(3, dtype=np.float64)
@@ -374,9 +385,10 @@ def load_case(npz_path: str, device: torch.device, stats_dict: dict, cfg: dict):
         l2i = label_to_index_map(nlab)
         conn_idx_np = np.vectorize(lambda x: l2i[int(x)])(conn)
         s_elem_list = []
+        agg_mode = get_s_elem_agg_mode(cfg)  # [CHANGED]
         for t in range(s_node.shape[0]):
             vals = s_node[t][conn_idx_np]
-            if cfg["s_prev_mode"] == "mean":
+            if agg_mode == "mean":
                 s_elem_list.append(vals.mean(axis=1))
             else:
                 s_elem_list.append(np.sqrt((vals*vals).mean(axis=1) + 1e-12))
@@ -427,8 +439,17 @@ def load_case(npz_path: str, device: torch.device, stats_dict: dict, cfg: dict):
         alpha = torch.full((N, 1), alpha_all[t], device=device)
         u_prev = torch.zeros((N, 3), device=device) if t == 0 else disp_t[t-1]
         v_prev = torch.zeros((N, 3), device=device) if t == 0 else vel_t[t-1]
-        s_prev_node = torch.zeros((N, 1), device=device) if t == 0 else elems_to_nodes_scalar(s_elem_t[t-1], elem_nodes_idx, mode="mean")
-        X[t] = torch.cat([coord_t, u_prev, alpha, flag_t, v_prev, s_prev_node.view(-1, 1)], dim=1)
+
+        # [CHANGED] s_prev_node respects cfg["s_prev_mode"] (mean/rms/none)
+        if t == 0 or cfg.get("s_prev_mode", "mean") == "none":
+            s_prev_node = torch.zeros((N, 1), device=device)
+        else:
+            s_prev_node = elems_to_nodes_scalar(
+                s_elem_t[t-1], elem_nodes_idx,
+                mode=("rms" if cfg.get("s_prev_mode", "mean") == "rms" else "mean")
+            ).view(-1, 1)
+
+        X[t] = torch.cat([coord_t, u_prev, alpha, flag_t, v_prev, s_prev_node], dim=1)
 
     return dict(
         X_node=X, node_edge=node_edge, elem_edge=elem_edge, elem_nodes_idx=elem_nodes_idx,
@@ -476,12 +497,13 @@ def evaluate(model, files, device, gstats, node_e0, elem_e0, enodes0, cfg):
         Ls = huber_loss(s_elem_hat, Y_se_batch, beta=0.5, reduction="mean") if cfg["use_smooth_l1"] else F.mse_loss(s_elem_hat, Y_se_batch, reduction="mean")
         Lrf2 = F.mse_loss(rf2_hat, Y_rf2_batch, reduction="mean")
 
+        # [CHANGED] safer Laplacian: use true N from u_hat, not node_e0.max()+1
         Llap = torch.zeros((), device=device)
         if cfg["lambda_lap"] > 0.0:
-            T_b = u_hat.size(0)
-            node_edge_b = build_batched_edge_index(node_e0, B, node_e0.max().item() + 1)
+            T_b, B_b, N_b, _ = u_hat.shape
+            node_edge_b = build_batched_edge_index(node_e0, B_b, N_b)
             for t in range(T_b):
-                Llap += laplacian_smooth_loss(u_hat[t].reshape(B * (node_e0.max().item() + 1), 3), node_edge_b)
+                Llap += laplacian_smooth_loss(u_hat[t].reshape(B_b * N_b, 3), node_edge_b)
             Llap /= T_b
 
         L = Lu + cfg["lambda_s"] * Ls + cfg["lambda_lap"] * Llap + cfg["lambda_rf2"] * Lrf2
@@ -509,7 +531,10 @@ def main():
     if args.save_path:
         cfg["save_path"] = args.save_path
 
-    os.makedirs(os.path.dirname(cfg["save_path"]), exist_ok=True)
+    # [CHANGED] avoid os.makedirs("") when save_path has no directory
+    save_dir = os.path.dirname(cfg["save_path"])
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
 
     set_seed(cfg["seed"])
     device = torch.device("cuda" if cfg["use_cuda"] and torch.cuda.is_available() else "cpu")
@@ -520,20 +545,20 @@ def main():
         raise FileNotFoundError("No .npz files found. Check data_dir or single_npz path.")
     print(f"Found {len(files)} simulation cases.")
 
-    # Global normalization
-    if cfg["norm_scope"] == "global":
-        print("Computing global normalization statistics across all cases...")
-        gstats = compute_global_stats(files, frame_stride=cfg["frame_stride"], s_elem_mode=cfg["s_prev_mode"])
-    else:
-        print("Using per-case normalization.")
-        gstats = None
-
-    # Train/val split
+    # [CHANGED] Train/val split first (avoid global norm leakage)
     random.shuffle(files)
     n_val = max(1, int(len(files) * cfg["val_ratio"])) if cfg["val_ratio"] > 0 and len(files) >= 2 else 0
     val_files = files[:n_val]
     train_files = files[n_val:]
     print(f"Training cases: {len(train_files)} | Validation cases: {len(val_files)}")
+
+    # [CHANGED] Global normalization computed on TRAIN only
+    if cfg["norm_scope"] == "global":
+        print("Computing global normalization statistics across TRAIN cases only...")
+        gstats = compute_global_stats(train_files, frame_stride=cfg["frame_stride"], s_elem_mode=get_s_elem_agg_mode(cfg))
+    else:
+        print("Using per-case normalization.")
+        gstats = None
 
     # Load reference graph structure from first training case
     ref_case = load_case(train_files[0], device, gstats, cfg)
