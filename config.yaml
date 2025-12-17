@@ -1,48 +1,78 @@
-# ========================= Data Settings =========================
-data:
-  data_dir: "data"              # Directory containing .npz files
-  single_npz: null              # If set, train on a single .npz file only (overrides data_dir)
-  norm_scope: "global"          # Normalization scope: "global" or "per_case"
-  frame_stride: 2               # Frame downsampling interval (e.g., use every 2nd frame)
-
-# ========================= Model Settings =========================
-model:
-  hidden_node: 128              # Hidden dimension for node GConvGRU
-  hidden_elem: 128              # Hidden dimension for element GConvGRU
-  K_node: 1                     # Chebyshev polynomial order for node graph convolution
-  K_elem: 1                     # Chebyshev polynomial order for element graph convolution
-  in_node_features: 12          # Node input feature dimension (fixed by data structure)
-
-# ========================= Training Settings =========================
-training:
-  epochs: 800
-  lr: 0.005
-  batch_cases: 16               # Number of simulation cases per batch
-  clip_norm: 0.5                # Gradient clipping norm (0 to disable)
-  val_ratio: 0.1                # Fraction of cases used for validation (0 to disable)
-  val_interval: 10              # Validate every N epochs
-  save_best: true               # Save best model based on validation loss
-
-# ========================= Loss Weights =========================
-loss:
-  lambda_s: 0.0                 # Weight for element stress loss
-  lambda_lap: 0.0               # Weight for Laplacian smoothing loss on displacement
-  lambda_rf2: 0.0               # Weight for global reaction force (RF2) loss
-  use_smooth_l1: true           # Use Huber (Smooth L1) loss for stress instead of MSE
-
-# ========================= Teacher Forcing =========================
-teacher_forcing:
-  k_steps: 100                  # Number of epochs to apply decaying teacher forcing
-  p_start: 0.0                  # Initial teacher forcing probability
-
-# ========================= Graph Construction =========================
-graph:
-  edge_mode_node: "abaqus"      # Node graph: "abaqus" (only element edges) or "complete"
-  elem_adj_mode: "face"         # Element graph adjacency: "face", "node", or "none"
-  s_prev_mode: "mean"           # Stress feedback to nodes: "mean", "rms", or "none"
-  no_s_feedback: true           # If true, completely disable stress feedback
-
-# ========================= Miscellaneous =========================
+# ===================== Data =====================
 seed: 42
-use_cuda: true                  # Use GPU if available
-save_path: "checkpoints/joint_us_dual_rf2_batch16.pth"   # Final model save path
+use_cuda: true
+
+# Data source (choose one: data_dir or single_npz)
+data_dir: "/path/to/your/npz_dir"
+single_npz: null
+
+# Model output
+save_path: "checkpoints/dualgraph_gconvgru_final.pth"
+save_best: true
+
+# Frame sampling stride
+frame_stride: 1
+
+# Normalization scope: "per_case" or "global"
+norm_scope: "global"
+
+# Validation split ratio (0–1)
+val_ratio: 0.1
+# Validation interval (epochs)
+val_interval: 1
+
+# ===================== Graph construction =====================
+# Node graph mode: "abaqus" (C3D8 12-edge connectivity) or full intra-element graph
+edge_mode_node: "abaqus"
+
+# Element adjacency: "face", "node", or "none"
+elem_adj_mode: "face"
+
+# ===================== Input features =====================
+# [coord(3), u_prev(3), alpha(1), flag(1), v_prev(3), s_prev_node(1)]
+in_node_features: 12
+
+# Element-stress feedback mode: "mean", "rms", or "none"
+s_prev_mode: "mean"
+# Force disabling stress feedback regardless of s_prev_mode
+no_s_feedback: false
+
+# ===================== Model =====================
+hidden_node: 128
+hidden_elem: 128
+K_node: 1
+K_elem: 1
+
+# ===================== Training =====================
+epochs: 800
+batch_cases: 16
+lr: 0.001
+
+# Gradient clipping (0 = disabled)
+clip_norm: 1.0
+
+# ===================== Loss weights =====================
+# Total loss = Lu + lambda_s*Ls + lambda_lap*Llap + lambda_rf2*Lrf2
+lambda_s: 1.0
+lambda_lap: 0.0
+lambda_rf2: 1.0
+
+# Use Smooth L1 (Huber) loss for element stress
+use_smooth_l1: true
+
+# ===================== Teacher Forcing =====================
+# Initial teacher forcing probability
+p_tf_start: 1.0
+# Linear decay to 0 over k_steps_tf epochs (0 disables teacher forcing)
+k_steps_tf: 20
+
+# ===================== LR Scheduler (ReduceLROnPlateau) =====================
+use_lr_sched: true
+# Monitor metric: "train" or "val"
+plateau_monitor: "val"
+plateau_factor: 0.5
+plateau_patience: 3
+plateau_threshold: 1.0e-4
+plateau_cooldown: 0
+plateau_min_lr: 1.0e-6
+plateau_verbose: true
